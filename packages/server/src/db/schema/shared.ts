@@ -18,6 +18,32 @@ export const triggerType = pgEnum("triggerType", ["push", "tag"]);
 
 export const sqldNode = pgEnum("sqldNode", ["primary", "replica"]);
 
+// Governs what happens to a deploy when the QC agent step or the test-exec
+// step can't produce a verdict (timeout, QC service unreachable, etc).
+export const failurePolicy = pgEnum("failurePolicy", ["open", "closed"]);
+
+export const testPlanStatus = pgEnum("testPlanStatus", [
+	"none",
+	"generating",
+	"ready",
+	"error",
+]);
+
+export const qcVerdict = pgEnum("qcVerdict", ["skipped", "ready", "error"]);
+
+// Where the tests of the pre-deploy test step come from: a command the user
+// wrote, or tests the QC service generated from the test plan.
+export const testExecSource = pgEnum("testExecSource", [
+	"command",
+	"generated",
+]);
+
+export const testExecStatus = pgEnum("testExecStatus", [
+	"skipped",
+	"passed",
+	"failed",
+]);
+
 export interface HealthCheckSwarm {
 	Test?: string[] | undefined;
 	Interval?: number | undefined;

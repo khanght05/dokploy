@@ -2,6 +2,8 @@ import { relations } from "drizzle-orm";
 import {
 	type AnyPgColumn,
 	boolean,
+	integer,
+	jsonb,
 	pgEnum,
 	pgTable,
 	text,
@@ -16,6 +18,7 @@ import { previewDeployments } from "./preview-deployments";
 import { rollbacks } from "./rollbacks";
 import { schedules } from "./schedule";
 import { server } from "./server";
+import { qcVerdict, testExecStatus } from "./shared";
 import { volumeBackups } from "./volume-backups";
 export const deploymentStatus = pgEnum("deploymentStatus", [
 	"running",
@@ -73,6 +76,32 @@ export const deployments = pgTable("deployment", {
 	buildServerId: text("buildServerId").references(() => server.serverId, {
 		onDelete: "cascade",
 	}),
+	// Snapshot of the QC/test-exec verdict for this specific deploy
+	testPlanVersionAtDeploy: integer("testPlanVersionAtDeploy"),
+	qcVerdict: qcVerdict("qcVerdict"),
+	testExecStatus: testExecStatus("testExecStatus"),
+	testExecExitCode: integer("testExecExitCode"),
+	testExecSummary: jsonb("testExecSummary").$type<{
+		source: "command" | "generated";
+		verdict?: string;
+		headline?: string;
+		passed?: number | null;
+		failed?: number | null;
+		skipped?: number | null;
+		failures?: string[];
+		categories?: Record<string, number>;
+		details?: {
+			name: string;
+			category: string;
+			reason?: string;
+			suggestedFix?: string;
+		}[];
+	}>(),
+	qcRunId: text("qcRunId"),
+	qcStageStatus:
+		jsonb("qcStageStatus").$type<
+			{ stage: string; status: string; error?: string | null }[]
+		>(),
 });
 
 export const deploymentsRelations = relations(deployments, ({ one }) => ({

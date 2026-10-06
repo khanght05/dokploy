@@ -7,15 +7,20 @@ import {
 	findEnvironmentById,
 	findPreviewDeploymentsByApplicationId,
 	findProjectById,
+	findTestPlanHistoryEntry,
 	generateTraefikMeDomain,
 	getAccessibleServerIds,
 	getApplicationStats,
 	getContainerLogs,
+	getGitCommitInfo,
 	getWebServerSettings,
 	IS_CLOUD,
+	isTestPlanGenerating,
+	listTestPlanHistory,
 	mechanizeDockerContainer,
 	readConfig,
 	readRemoteConfig,
+	regenerateTestPlanInBackground,
 	removeDeployments,
 	removeDirectoryCode,
 	removeMonitoringDirectory,
@@ -79,6 +84,25 @@ import {
 	myQueue,
 } from "@/server/queues/queueSetup";
 import { cancelDeployment, deploy } from "@/server/utils/deploy";
+
+// The same checks `application.one` makes, for procedures that only need to
+// know the caller may read the application.
+const assertCanReadApplication = async (
+	ctx: Parameters<typeof checkServiceAccess>[0],
+	applicationId: string,
+) => {
+	await checkServiceAccess(ctx, applicationId, "read");
+	const application = await findApplicationById(applicationId);
+	if (
+		application.environment.project.organizationId !==
+		ctx.session.activeOrganizationId
+	) {
+		throw new TRPCError({
+			code: "UNAUTHORIZED",
+			message: "You are not authorized to access this application",
+		});
+	}
+};
 
 export const applicationRouter = createTRPCRouter({
 	create: protectedProcedure
@@ -486,6 +510,74 @@ export const applicationRouter = createTRPCRouter({
 				resourceId: application.applicationId,
 				resourceName: application.appName,
 			});
+		}),
+	// Every test plan the QC service produced for this application, newest first.
+	testPlanHistory: protectedProcedure
+		.input(apiFindOneApplication)
+		.query(async ({ input, ctx }) => {
+			await assertCanReadApplication(ctx, input.applicationId);
+			return await listTestPlanHistory(input.applicationId);
+		}),
+	testPlanHistoryEntry: protectedProcedure
+		.input(
+			z.object({
+				applicationId: z.string().min(1),
+				testPlanHistoryId: z.string().min(1),
+			}),
+		)
+		.query(async ({ input, ctx }) => {
+			await assertCanReadApplication(ctx, input.applicationId);
+			const entry = await findTestPlanHistoryEntry(
+				input.applicationId,
+				input.testPlanHistoryId,
+			);
+			if (!entry) {
+				throw new TRPCError({
+					code: "NOT_FOUND",
+					message: "That test plan version does not exist.",
+				});
+			}
+			return entry;
+		}),
+	regenerateTestPlan: protectedProcedure
+		.input(apiFindOneApplication)
+		.mutation(async ({ input, ctx }) => {
+			await checkServicePermissionAndAccess(ctx, input.applicationId, {
+				deployment: ["create"],
+			});
+			const application = await findApplicationById(input.applicationId);
+			if (!application.qcEnabled) {
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Enable the QC test-plan step first",
+				});
+			}
+			if (isTestPlanGenerating(application)) {
+				throw new TRPCError({
+					code: "CONFLICT",
+					message: "A test plan is already being generated",
+				});
+			}
+			const commit = await getGitCommitInfo({
+				appName: application.appName,
+				type: "application",
+				serverId: application.buildServerId || application.serverId,
+			});
+			if (!commit?.hash) {
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message:
+						"There is no deployed code to plan yet. Deploy the application first.",
+				});
+			}
+			regenerateTestPlanInBackground(application, commit.hash);
+			await audit(ctx, {
+				action: "update",
+				resourceType: "application",
+				resourceId: application.applicationId,
+				resourceName: application.appName,
+			});
+			return { started: true };
 		}),
 	saveEnvironment: protectedProcedure
 		.input(apiSaveEnvironmentVariables)

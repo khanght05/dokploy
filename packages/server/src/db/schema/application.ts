@@ -32,6 +32,7 @@ import {
 	certificateType,
 	type EndpointSpecSwarm,
 	EndpointSpecSwarmSchema,
+	failurePolicy,
 	type HealthCheckSwarm,
 	HealthCheckSwarmSchema,
 	type LabelsSwarm,
@@ -44,6 +45,8 @@ import {
 	RestartPolicySwarmSchema,
 	type ServiceModeSwarm,
 	ServiceModeSwarmSchema,
+	testExecSource,
+	testPlanStatus,
 	triggerType,
 	type UlimitsSwarm,
 	UlimitsSwarmSchema,
@@ -237,6 +240,23 @@ export const applications = pgTable("application", {
 	detachDokployNetwork: boolean("detachDokployNetwork")
 		.notNull()
 		.default(false),
+	// QC agent: pre-build step that generates/updates a test-plan document
+	qcEnabled: boolean("qcEnabled").notNull().default(false),
+	qcProjectId: text("qcProjectId"),
+	qcFailurePolicy: failurePolicy("qcFailurePolicy").notNull().default("open"),
+	testPlanContent: text("testPlanContent"),
+	testPlanVersion: integer("testPlanVersion").notNull().default(0),
+	testPlanStatus: testPlanStatus("testPlanStatus").notNull().default("none"),
+	testPlanStartedAt: text("testPlanStartedAt"),
+	testPlanError: text("testPlanError"),
+	// Test-exec: runs the app's own test command inside the built image
+	testExecEnabled: boolean("testExecEnabled").notNull().default(false),
+	testCommand: text("testCommand"),
+	testExecSource: testExecSource("testExecSource").notNull().default("command"),
+	testRunnerImage: text("testRunnerImage"),
+	testExecFailurePolicy: failurePolicy("testExecFailurePolicy")
+		.notNull()
+		.default("closed"),
 });
 
 export const applicationsRelations = relations(
@@ -390,6 +410,19 @@ const createSchema = createInsertSchema(applications, {
 		.max(2 * 1024 * 1024, "Icon must be less than 2MB")
 		.nullable()
 		.optional(),
+	qcEnabled: z.boolean().optional(),
+	qcProjectId: z.string().nullable().optional(),
+	qcFailurePolicy: z.enum(["open", "closed"]).optional(),
+	testPlanContent: z.string().nullable().optional(),
+	testPlanVersion: z.number().optional(),
+	testPlanStatus: z.enum(["none", "generating", "ready", "error"]).optional(),
+	testPlanStartedAt: z.string().nullable().optional(),
+	testPlanError: z.string().nullable().optional(),
+	testExecEnabled: z.boolean().optional(),
+	testCommand: z.string().nullable().optional(),
+	testExecSource: z.enum(["command", "generated"]).optional(),
+	testRunnerImage: z.string().nullable().optional(),
+	testExecFailurePolicy: z.enum(["open", "closed"]).optional(),
 });
 
 export const apiCreateApplication = createSchema.pick({

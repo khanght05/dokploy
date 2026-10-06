@@ -46,6 +46,18 @@ Per-package dev servers (when working on just one piece): `pnpm --filter=@dokplo
 - **`@dokploy/server` has a source/dist switch**: `pnpm run server:script` (= `switch:dev`) points its package exports at `src/` for local development; `switch:prod` points at compiled `dist/` for production builds. If cross-package changes in `packages/server` aren't showing up in the app, check which mode is active.
 - **Auth** uses `better-auth` (see `packages/server/src/auth`, `apps/dokploy/server/api/trpc.ts` context creation via `validateRequest`), with plugins for API keys, passkeys, SSO, SCIM.
 
+## QC step (fork-specific)
+
+Applications can opt in (`qcEnabled`) to a QC test-plan step backed by the external QC service (QC_Agent_Tool's `app.service_main`, API under `/v1`). Configured by `QC_SERVICE_BASE_URL`, `QC_SERVICE_API_KEY`, `QC_SERVICE_TIMEOUT_SECONDS` (client in `packages/server/src/services/qc-service-client.ts`).
+- `deployApplication` (`services/application.ts`) splits a QC-enabled deploy in two shell runs: clone (+patches), then the QC step, then build (+tests). The plan therefore describes exactly the commit read from the fresh clone (`getGitCommitInfo`), and clone auth stays in the provider helpers. Apps without QC (or with an unsupported source) still run as one script.
+- `services/qc-step.ts` `runQcStep` creates a service run (`Idempotency-Key` = deployment id), polls it, and caches the plan on the application (`testPlanContent/Version/Status/Error`). It takes a compare-and-set claim (`claimTestPlanGeneration`) so a deploy and a manual regenerate never plan the same app twice; `qcFailurePolicy` `"closed"` makes a failure abort the deploy. Only `github` and `git` sources are supported; others skip.
+- `regenerateTestPlan` (router) is non-blocking: it plans the already-deployed commit with `force`, and the UI follows `testPlanStatus`.
+- `utils/builders/run-test-command.ts` runs the app's own test command inside the built image after build (`testExecSource` = `command`).
+- With `testExecSource` = `generated` the QC step asks the service for plan + generate + triage and stops when the run is `awaiting_exec`; `services/qc-exec.ts` then downloads the sha256-checked bundle and manifest, runs it via `utils/builders/run-generated-tests.ts` in a throw-away container on the build server (source copy, no app env, no capabilities, bounded resources, image per language or `testRunnerImage`), posts the results to the service and records status/summary on the deployment. This happens before the build; `testExecFailurePolicy` decides whether a failure, or a run that couldn't be made, blocks the deploy.
+- After the tests run the service triages them: an agent classifies each failure (application bug, wrong test, flaky, environment). Only an application bug (verdict `fail`) can block the deploy; failures judged otherwise (`warn`) are recorded as failed on the deployment but never block. The deployments list shows the classification and a Report button (`deployment.qcReport`, shown in a sandboxed iframe). An optional webhook (`pages/api/qc/webhook.ts`, HMAC-verified in `services/qc-webhook.ts`) wakes the poller early; polling stays authoritative.
+- Operator documentation (setup, policies, troubleshooting): `docs/qc-step.md`.
+- UI lives in `components/dashboard/application/qc/` and `advanced/qc/`. `qcProjectId` is a leftover column from the old per-project API and is unused.
+
 ## Code style
 - Don't write comments that restate what the code already says.
 - Comment only the "why" when something isn't obvious: workarounds,

@@ -10,6 +10,10 @@ import {
 	getBuildCommand,
 	mechanizeDockerContainer,
 } from "@dokploy/server/utils/builders";
+import {
+	getTestExecCommand,
+	readTestExecExitCode,
+} from "@dokploy/server/utils/builders/run-test-command";
 import { sendBuildErrorNotifications } from "@dokploy/server/utils/notifications/build-error";
 import { sendBuildSuccessNotifications } from "@dokploy/server/utils/notifications/build-success";
 import {
@@ -28,13 +32,14 @@ import { cloneGithubRepository } from "@dokploy/server/utils/providers/github";
 import { cloneGitlabRepository } from "@dokploy/server/utils/providers/gitlab";
 import { createTraefikConfig } from "@dokploy/server/utils/traefik/application";
 import { TRPCError } from "@trpc/server";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull, lt, ne, or } from "drizzle-orm";
 import type { z } from "zod";
 import { encodeBase64 } from "../utils/docker/utils";
 import { getDokployUrl } from "./admin";
 import {
 	createDeployment,
 	createDeploymentPreview,
+	type Deployment,
 	updateDeployment,
 	updateDeploymentStatus,
 } from "./deployment";
@@ -51,7 +56,33 @@ import {
 	updatePreviewDeployment,
 } from "./preview-deployment";
 import { validUniqueServerAppName } from "./project";
+import { runQcGeneratedTests } from "./qc-exec";
+import { getQcRepoSource, runQcStep } from "./qc-step";
 export type Application = typeof applications.$inferSelect;
+
+const toTestExecStatus = (
+	exitCode: number | null,
+): Deployment["testExecStatus"] => {
+	if (exitCode === null) return "skipped";
+	return exitCode === 0 ? "passed" : "failed";
+};
+
+const usesGeneratedTests = (
+	application: Pick<Application, "testExecEnabled" | "testExecSource">,
+) => application.testExecEnabled && application.testExecSource === "generated";
+
+const appendDeploymentLog = async (
+	logPath: string,
+	serverId: string | null | undefined,
+	message: string,
+) => {
+	const command = `echo "${encodeBase64(message)}" | base64 -d >> "${logPath}"; echo >> "${logPath}";`;
+	if (serverId) {
+		await execAsyncRemote(serverId, command);
+	} else {
+		await execAsync(command);
+	}
+};
 
 export const createApplication = async (
 	input: z.infer<typeof apiCreateApplication>,
@@ -160,6 +191,51 @@ export const updateApplication = async (
 	return application[0];
 };
 
+// Atomic compare-and-set so two concurrent callers (a deploy and a manual
+// regenerate, or two deploys) can never both run the QC step for the same
+// application. A "generating" row older than `staleAfterMs` is treated as
+// abandoned by a crashed run and can be claimed again.
+export const claimTestPlanGeneration = async (
+	applicationId: string,
+	staleAfterMs: number,
+): Promise<boolean> => {
+	const now = new Date();
+	const staleBefore = new Date(now.getTime() - staleAfterMs).toISOString();
+	const claimed = await db
+		.update(applications)
+		.set({
+			testPlanStatus: "generating",
+			testPlanStartedAt: now.toISOString(),
+			testPlanError: null,
+		})
+		.where(
+			and(
+				eq(applications.applicationId, applicationId),
+				or(
+					ne(applications.testPlanStatus, "generating"),
+					isNull(applications.testPlanStartedAt),
+					lt(applications.testPlanStartedAt, staleBefore),
+				),
+			),
+		)
+		.returning({ applicationId: applications.applicationId });
+	return claimed.length > 0;
+};
+
+// Called on boot: no QC run can still be in flight in a freshly started
+// process, so any row left in "generating" was interrupted by the restart.
+export const resetStuckTestPlans = async () => {
+	const reset = await db
+		.update(applications)
+		.set({
+			testPlanStatus: "error",
+			testPlanError: "Interrupted by a server restart",
+		})
+		.where(eq(applications.testPlanStatus, "generating"))
+		.returning({ applicationId: applications.applicationId });
+	return reset.length;
+};
+
 export const updateApplicationStatus = async (
 	applicationId: string,
 	applicationStatus: Application["applicationStatus"],
@@ -222,14 +298,114 @@ export const deployApplication = async ({
 			});
 		}
 
-		command += await getBuildCommand(application);
+		const runScript = async (script: string) => {
+			const scriptWithLog = `(${script}) >> ${deployment.logPath} 2>&1`;
+			if (serverId) {
+				await execAsyncRemote(serverId, scriptWithLog);
+			} else {
+				await execAsync(scriptWithLog);
+			}
+		};
 
-		const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
-		if (serverId) {
-			await execAsyncRemote(serverId, commandWithLog);
+		if (application.qcEnabled && getQcRepoSource(application)) {
+			// The plan has to describe the commit that is about to be built, and
+			// only the clone knows which one that is (and has already authenticated
+			// against the provider), so everything up to here runs first.
+			await runScript(command);
+			command = "set -e;";
+
+			const commit = await getGitCommitInfo({
+				appName: application.appName,
+				type: "application",
+				serverId,
+			});
+			const generateTests = usesGeneratedTests(application);
+			const qcResult = await runQcStep(application, {
+				commitSha: commit?.hash,
+				idempotencyKey: deployment.deploymentId,
+				generateTests,
+			}).catch(async (error: unknown) => {
+				// "closed" policy: the deploy stops here, but the row and log should
+				// still say why.
+				const reason = error instanceof Error ? error.message : String(error);
+				await updateDeployment(deployment.deploymentId, {
+					qcVerdict: "error",
+				});
+				await appendDeploymentLog(
+					deployment.logPath,
+					serverId,
+					`== QC test plan blocked the deploy: ${reason} ==`,
+				);
+				throw error;
+			});
+			await updateDeployment(deployment.deploymentId, {
+				testPlanVersionAtDeploy: qcResult.testPlanVersion,
+				qcVerdict: qcResult.verdict,
+				qcRunId: qcResult.runId ?? null,
+				qcStageStatus: qcResult.stages ?? null,
+			});
+			await appendDeploymentLog(
+				deployment.logPath,
+				serverId,
+				qcResult.verdict === "ready"
+					? `== QC test plan v${qcResult.testPlanVersion} ready ==`
+					: `== QC test plan ${qcResult.verdict}${qcResult.reason ? `: ${qcResult.reason}` : ""} ==`,
+			);
+
+			if (generateTests) {
+				// Before the build: the tests only need the source, so a failure
+				// saves the time of a build that would be thrown away.
+				const outcome = await runQcGeneratedTests({
+					application,
+					qcResult,
+					deploymentId: deployment.deploymentId,
+					serverId,
+					log: (message) =>
+						appendDeploymentLog(deployment.logPath, serverId, message),
+				});
+				await updateDeployment(deployment.deploymentId, {
+					testExecStatus: outcome.status,
+					testExecExitCode: outcome.exitCode,
+					testExecSummary: outcome.summary,
+					...(outcome.stages ? { qcStageStatus: outcome.stages } : {}),
+				});
+				if (outcome.blockDeploy) {
+					throw outcome.blockDeploy;
+				}
+			}
 		} else {
-			await execAsync(commandWithLog);
+			if (application.qcEnabled) {
+				const qcResult = await runQcStep(application);
+				await updateDeployment(deployment.deploymentId, {
+					testPlanVersionAtDeploy: qcResult.testPlanVersion,
+					qcVerdict: qcResult.verdict,
+				});
+			}
+			if (usesGeneratedTests(application)) {
+				const headline =
+					"Generated tests need the QC step enabled and a GitHub or Git source";
+				await updateDeployment(deployment.deploymentId, {
+					testExecStatus: "skipped",
+					testExecSummary: {
+						source: "generated",
+						verdict: "skipped",
+						headline,
+					},
+				});
+				await appendDeploymentLog(
+					deployment.logPath,
+					serverId,
+					`== QC generated tests skipped: ${headline} ==`,
+				);
+			}
 		}
+
+		command += await getBuildCommand(application);
+		command += await getTestExecCommand(
+			applicationEntity,
+			deployment.deploymentId,
+		);
+		await runScript(command);
 
 		await mechanizeDockerContainer(application);
 		await updateDeploymentStatus(deployment.deploymentId, "done");
@@ -267,7 +443,7 @@ export const deployApplication = async ({
 			projectName: application.environment.project.name,
 			applicationName: application.name,
 			applicationType: "application",
-			// @ts-ignore
+			// @ts-expect-error
 			errorMessage: error?.message || "Error building",
 			buildLink,
 			organizationId: application.environment.project.organizationId,
@@ -288,6 +464,18 @@ export const deployApplication = async ({
 					description: `Commit: ${commitInfo.hash}`,
 				});
 			}
+		}
+
+		if (application.testExecEnabled && !usesGeneratedTests(application)) {
+			const testExitCode = await readTestExecExitCode(
+				deployment.logPath,
+				deployment.deploymentId,
+				serverId,
+			);
+			await updateDeployment(deployment.deploymentId, {
+				testExecStatus: toTestExecStatus(testExitCode),
+				testExecExitCode: testExitCode,
+			});
 		}
 	}
 	return true;
@@ -316,6 +504,7 @@ export const rebuildApplication = async ({
 		let command = "set -e;";
 		// Check case for docker only
 		command += await getBuildCommand(application);
+		command += await getTestExecCommand(application, deployment.deploymentId);
 		const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
 		if (serverId) {
 			await execAsyncRemote(serverId, commandWithLog);
@@ -354,6 +543,18 @@ export const rebuildApplication = async ({
 		await updateDeploymentStatus(deployment.deploymentId, "error");
 		await updateApplicationStatus(applicationId, "error");
 		throw error;
+	} finally {
+		if (application.testExecEnabled && !usesGeneratedTests(application)) {
+			const testExitCode = await readTestExecExitCode(
+				deployment.logPath,
+				deployment.deploymentId,
+				serverId,
+			);
+			await updateDeployment(deployment.deploymentId, {
+				testExecStatus: toTestExecStatus(testExitCode),
+				testExecExitCode: testExitCode,
+			});
+		}
 	}
 
 	return true;
