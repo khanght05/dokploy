@@ -27,10 +27,12 @@ export const getTestExecCommand = async (
 
 	const imageName = await getImageName(application);
 	const encodedCommand = encodeBase64(application.testCommand);
+	// `--entrypoint sh`: an image's own ENTRYPOINT would otherwise receive the
+	// command as arguments and the tests would never run.
 	// `|| __TEST_EXIT=$?` keeps the enclosing `set -e` from aborting before the
 	// marker line is written; the exit is re-raised below only when the policy
 	// says tests must block the deploy.
-	const runTests = `__TEST_EXIT=0; docker run --rm ${imageName} sh -c "$(echo ${encodedCommand} | base64 -d)" || __TEST_EXIT=$?`;
+	const runTests = `__TEST_EXIT=0; docker run --rm --entrypoint sh ${imageName} -c "$(echo ${encodedCommand} | base64 -d)" || __TEST_EXIT=$?`;
 	const abortOnFailure =
 		application.testExecFailurePolicy === "closed"
 			? "if [ $__TEST_EXIT -ne 0 ]; then exit $__TEST_EXIT; fi;"

@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
 	createRun: vi.fn(),
 	waitForRun: vi.fn(),
 	getPlan: vi.fn(),
+	getRun: vi.fn(),
+	findSource: vi.fn(),
 }));
 
 vi.mock("@dokploy/server/services/application", () => ({
@@ -17,12 +19,14 @@ vi.mock("@dokploy/server/services/application", () => ({
 }));
 vi.mock("@dokploy/server/services/test-plan-history", () => ({
 	recordTestPlanVersion: mocks.recordVersion,
+	findTestPlanVersionSource: mocks.findSource,
 }));
 vi.mock("@dokploy/server/services/qc-service-client", () => ({
 	QC_SERVICE_TIMEOUT_MS: 10_000,
 	createQcRun: mocks.createRun,
 	waitForQcRun: mocks.waitForRun,
 	getQcPlanMarkdown: mocks.getPlan,
+	getQcRun: mocks.getRun,
 }));
 
 import {
@@ -247,6 +251,23 @@ describe("runQcStep", () => {
 		});
 	});
 
+	test("a failed service run stops the deploy under the closed policy", async () => {
+		setStoredApp({ qcFailurePolicy: "closed" });
+		mocks.waitForRun.mockResolvedValue(
+			doneRun({
+				status: "cancelled",
+				error: { code: "cancelled", message: "cancelled by an operator" },
+			}),
+		);
+		await expect(runQcStep(app(), { commitSha: SHA })).rejects.toThrow(
+			"cancelled by an operator",
+		);
+		expect(mocks.updateApplication).toHaveBeenCalledWith("app1", {
+			testPlanStatus: "error",
+			testPlanError: "cancelled by an operator",
+		});
+	});
+
 	test("returns the error message under the open policy and records it", async () => {
 		mocks.createRun.mockRejectedValue(new Error("boom"));
 		const result = await runQcStep(app(), { commitSha: SHA });
@@ -282,7 +303,7 @@ describe("runQcStep", () => {
 			vi.useFakeTimers();
 		});
 
-		test("waits for it and reports its plan without calling the service", async () => {
+		const otherRunFinished = () =>
 			mocks.findApplicationById
 				.mockResolvedValueOnce(app({ testPlanStatus: "generating" }))
 				.mockResolvedValueOnce(app({ testPlanStatus: "generating" }))
@@ -290,11 +311,66 @@ describe("runQcStep", () => {
 					app({ testPlanStatus: "ready", testPlanVersion: 7 }),
 				);
 
+		test("reuses its plan when it is for the commit being deployed", async () => {
+			otherRunFinished();
+			mocks.findSource.mockResolvedValue({ commitSha: SHA, qcRunId: "run7" });
+			mocks.getRun.mockResolvedValue(doneRun({ runId: "run7" }));
+
 			const pending = runQcStep(app(), { commitSha: SHA });
 			await vi.advanceTimersByTimeAsync(10_000);
 			const result = await pending;
 
-			expect(result).toMatchObject({ verdict: "ready", testPlanVersion: 7 });
+			expect(result).toMatchObject({
+				verdict: "ready",
+				testPlanVersion: 7,
+				runId: "run7",
+			});
+			expect(mocks.findSource).toHaveBeenCalledWith("app1", "main", 7);
+			expect(mocks.createRun).not.toHaveBeenCalled();
+		});
+
+		test("plans for itself when the other plan is for a different commit", async () => {
+			otherRunFinished();
+			mocks.findSource.mockResolvedValue({
+				commitSha: "b".repeat(40),
+				qcRunId: "run7",
+			});
+			mocks.claim.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+			const pending = runQcStep(app(), { commitSha: SHA });
+			await vi.advanceTimersByTimeAsync(10_000);
+			const result = await pending;
+
+			expect(mocks.createRun).toHaveBeenCalledOnce();
+			expect(result).toMatchObject({ verdict: "ready", runId: "run1" });
+		});
+
+		test("never reuses it when this deploy has to run generated tests", async () => {
+			otherRunFinished();
+			mocks.findSource.mockResolvedValue({ commitSha: SHA, qcRunId: "run7" });
+			mocks.claim.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+
+			const pending = runQcStep(app(), { commitSha: SHA, generateTests: true });
+			await vi.advanceTimersByTimeAsync(10_000);
+			await pending;
+
+			expect(mocks.createRun).toHaveBeenCalledOnce();
+		});
+
+		test("reports an error when a third run took the claim meanwhile", async () => {
+			otherRunFinished();
+			mocks.findSource.mockResolvedValue(undefined);
+			setStoredApp({ qcFailurePolicy: "closed" });
+			mocks.findApplicationById
+				.mockReset()
+				.mockResolvedValueOnce(app({ qcFailurePolicy: "closed" }))
+				.mockResolvedValue(
+					app({ testPlanStatus: "ready", testPlanVersion: 7 }),
+				);
+
+			await expect(runQcStep(app(), { commitSha: SHA })).rejects.toThrow(
+				/Another test plan run/,
+			);
 			expect(mocks.createRun).not.toHaveBeenCalled();
 		});
 

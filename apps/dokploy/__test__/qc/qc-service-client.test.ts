@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const fetchMock = vi.fn();
 
-const load = async () => {
+const load = async (requestTimeoutSeconds?: string) => {
 	vi.resetModules();
 	process.env.QC_SERVICE_BASE_URL = "http://qc.test";
 	process.env.QC_SERVICE_API_KEY = "secret";
 	process.env.QC_SERVICE_TIMEOUT_SECONDS = "9";
+	if (requestTimeoutSeconds) {
+		process.env.QC_SERVICE_REQUEST_TIMEOUT_SECONDS = requestTimeoutSeconds;
+	}
 	return await import("@dokploy/server/services/qc-service-client");
 };
 
@@ -35,6 +38,20 @@ describe("qc-service-client", () => {
 		vi.useRealTimers();
 		vi.unstubAllGlobals();
 		delete process.env.QC_SERVICE_BASE_URL;
+		delete process.env.QC_SERVICE_REQUEST_TIMEOUT_SECONDS;
+	});
+
+	test("gives up on a request the service never answers", async () => {
+		fetchMock.mockImplementation(
+			(_url: string, init: RequestInit) =>
+				new Promise((_resolve, reject) => {
+					init.signal?.addEventListener("abort", () =>
+						reject(new DOMException("aborted", "TimeoutError")),
+					);
+				}),
+		);
+		const { getQcRun } = await load("0.05");
+		await expect(getQcRun("run1")).rejects.toThrow(/did not answer/);
 	});
 
 	test("creates a run with the bearer key and an Idempotency-Key", async () => {

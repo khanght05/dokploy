@@ -144,10 +144,7 @@ export const ShowTestPlan = ({ applicationId }: Props) => {
 					)}
 				</CardContent>
 			</Card>
-			<ShowTestPlanHistory
-				applicationId={applicationId}
-				currentVersion={data.testPlanVersion}
-			/>
+			<ShowTestPlanHistory applicationId={applicationId} />
 		</div>
 	);
 };

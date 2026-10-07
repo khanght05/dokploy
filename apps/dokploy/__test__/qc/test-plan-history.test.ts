@@ -34,6 +34,7 @@ vi.mock("@dokploy/server/db", () => {
 
 import {
 	MAX_PLAN_VERSIONS_KEPT,
+	markCurrentPlan,
 	recordTestPlanVersion,
 } from "@dokploy/server/services/test-plan-history";
 
@@ -102,5 +103,27 @@ describe("recordTestPlanVersion", () => {
 	it("never throws, so a history problem cannot fail a deploy", async () => {
 		calls.fail = true;
 		await expect(recordTestPlanVersion(plan)).resolves.toBeUndefined();
+	});
+});
+
+describe("markCurrentPlan", () => {
+	const entries = [
+		{ branch: "main", version: 3 },
+		{ branch: "feature", version: 3 },
+		{ branch: "main", version: 2 },
+	];
+
+	it("marks only the entry on the current branch with the current version", () => {
+		const marked = markCurrentPlan(entries, { branch: "main", version: 3 });
+		expect(marked.map((entry) => entry.isCurrent)).toEqual([
+			true,
+			false,
+			false,
+		]);
+	});
+
+	it("marks nothing when the application has no resolvable branch", () => {
+		const marked = markCurrentPlan(entries, { branch: undefined, version: 3 });
+		expect(marked.some((entry) => entry.isCurrent)).toBe(false);
 	});
 });

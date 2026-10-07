@@ -22,6 +22,7 @@ import { findServerById } from "@dokploy/server/services/server";
 import { TRPCError } from "@trpc/server";
 import { desc, eq } from "drizzle-orm";
 import { z } from "zod";
+import { assertApplicationInActiveOrganization } from "@/server/api/utils/application-access";
 import { audit } from "@/server/api/utils/audit";
 import {
 	apiFindAllByApplication,
@@ -174,6 +175,10 @@ export const deploymentRouter = createTRPCRouter({
 			await checkServicePermissionAndAccess(ctx, deployment.applicationId, {
 				deployment: ["read"],
 			});
+			await assertApplicationInActiveOrganization(
+				ctx,
+				deployment.applicationId,
+			);
 			if (!deployment.qcRunId) {
 				throw new TRPCError({
 					code: "NOT_FOUND",

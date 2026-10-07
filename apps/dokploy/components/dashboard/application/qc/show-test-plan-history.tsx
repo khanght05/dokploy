@@ -23,7 +23,6 @@ import { FULLSCREEN_DIALOG_CLASS } from "./fullscreen-dialog";
 
 interface Props {
 	applicationId: string;
-	currentVersion: number;
 }
 
 const PlanDialog = ({
@@ -78,10 +77,7 @@ const PlanDialog = ({
 };
 
 // Earlier versions of the plan, kept so they can be read after being replaced.
-export const ShowTestPlanHistory = ({
-	applicationId,
-	currentVersion,
-}: Props) => {
+export const ShowTestPlanHistory = ({ applicationId }: Props) => {
 	const [open, setOpen] = useState<string | null>(null);
 	const { data } = api.application.testPlanHistory.useQuery(
 		{ applicationId },
@@ -113,7 +109,7 @@ export const ShowTestPlanHistory = ({
 					>
 						<div className="flex flex-wrap items-center gap-2 text-sm">
 							<Badge variant="outline">v{entry.version}</Badge>
-							{entry.version === currentVersion && <Badge>current</Badge>}
+							{entry.isCurrent && <Badge>current</Badge>}
 							{branches.size > 1 && (
 								<span className="text-muted-foreground">{entry.branch}</span>
 							)}

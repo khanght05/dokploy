@@ -13,10 +13,12 @@ import {
 	getApplicationStats,
 	getContainerLogs,
 	getGitCommitInfo,
+	getQcRepoSource,
 	getWebServerSettings,
 	IS_CLOUD,
 	isTestPlanGenerating,
 	listTestPlanHistory,
+	markCurrentPlan,
 	mechanizeDockerContainer,
 	readConfig,
 	readRemoteConfig,
@@ -56,6 +58,7 @@ import {
 	protectedProcedure,
 	withPermission,
 } from "@/server/api/trpc";
+import { assertApplicationInActiveOrganization } from "@/server/api/utils/application-access";
 import { audit } from "@/server/api/utils/audit";
 import {
 	apiCreateApplication,
@@ -92,16 +95,7 @@ const assertCanReadApplication = async (
 	applicationId: string,
 ) => {
 	await checkServiceAccess(ctx, applicationId, "read");
-	const application = await findApplicationById(applicationId);
-	if (
-		application.environment.project.organizationId !==
-		ctx.session.activeOrganizationId
-	) {
-		throw new TRPCError({
-			code: "UNAUTHORIZED",
-			message: "You are not authorized to access this application",
-		});
-	}
+	return await assertApplicationInActiveOrganization(ctx, applicationId);
 };
 
 export const applicationRouter = createTRPCRouter({
@@ -515,8 +509,14 @@ export const applicationRouter = createTRPCRouter({
 	testPlanHistory: protectedProcedure
 		.input(apiFindOneApplication)
 		.query(async ({ input, ctx }) => {
-			await assertCanReadApplication(ctx, input.applicationId);
-			return await listTestPlanHistory(input.applicationId);
+			const application = await assertCanReadApplication(
+				ctx,
+				input.applicationId,
+			);
+			return markCurrentPlan(await listTestPlanHistory(input.applicationId), {
+				branch: getQcRepoSource(application)?.branch,
+				version: application.testPlanVersion,
+			});
 		}),
 	testPlanHistoryEntry: protectedProcedure
 		.input(
@@ -545,7 +545,10 @@ export const applicationRouter = createTRPCRouter({
 			await checkServicePermissionAndAccess(ctx, input.applicationId, {
 				deployment: ["create"],
 			});
-			const application = await findApplicationById(input.applicationId);
+			const application = await assertApplicationInActiveOrganization(
+				ctx,
+				input.applicationId,
+			);
 			if (!application.qcEnabled) {
 				throw new TRPCError({
 					code: "BAD_REQUEST",

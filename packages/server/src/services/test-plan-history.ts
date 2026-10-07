@@ -66,6 +66,41 @@ export const listTestPlanHistory = async (applicationId: string) =>
 		.where(eq(testPlanHistory.applicationId, applicationId))
 		.orderBy(desc(testPlanHistory.createdAt));
 
+// Which commit and run produced a given plan version, if it was recorded.
+export const findTestPlanVersionSource = async (
+	applicationId: string,
+	branch: string,
+	version: number,
+) => {
+	const [entry] = await db
+		.select({
+			commitSha: testPlanHistory.commitSha,
+			qcRunId: testPlanHistory.qcRunId,
+		})
+		.from(testPlanHistory)
+		.where(
+			and(
+				eq(testPlanHistory.applicationId, applicationId),
+				eq(testPlanHistory.branch, branch),
+				eq(testPlanHistory.version, version),
+			),
+		)
+		.limit(1);
+	return entry;
+};
+
+// Versions are counted per branch, so the number alone can't say which entry
+// the application is using now.
+export const markCurrentPlan = <T extends { branch: string; version: number }>(
+	entries: T[],
+	current: { branch: string | undefined; version: number },
+) =>
+	entries.map((entry) => ({
+		...entry,
+		isCurrent:
+			entry.branch === current.branch && entry.version === current.version,
+	}));
+
 export const findTestPlanHistoryEntry = async (
 	applicationId: string,
 	testPlanHistoryId: string,

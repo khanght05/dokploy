@@ -7,11 +7,15 @@ import {
 import {
 	createQcRun,
 	getQcPlanMarkdown,
+	getQcRun,
 	QC_SERVICE_TIMEOUT_MS,
 	type QcStageView,
 	waitForQcRun,
 } from "./qc-service-client";
-import { recordTestPlanVersion } from "./test-plan-history";
+import {
+	findTestPlanVersionSource,
+	recordTestPlanVersion,
+} from "./test-plan-history";
 
 export interface QcStepResult {
 	verdict: "skipped" | "ready" | "error";
@@ -81,12 +85,16 @@ export interface RunQcStepOptions {
 }
 
 // Another run already holds the claim for this application: wait for it
-// instead of starting a duplicate, then report its outcome under the same
-// failure policy as if this call had produced it.
+// instead of starting a duplicate. Its plan is only reused when it is for the
+// commit being deployed and no tests have to be generated for this deploy (a
+// run that did not generate them cannot be executed by it); otherwise the
+// caller plans for itself once the other run has finished.
 const waitForRunningTestPlan = async (
 	application: Application,
+	branch: string,
+	options: RunQcStepOptions,
 	shouldThrow: boolean,
-): Promise<QcStepResult> => {
+): Promise<QcStepResult | "plan-again"> => {
 	const deadline = Date.now() + QC_SERVICE_TIMEOUT_MS;
 	let latest = await findApplicationById(application.applicationId);
 
@@ -96,7 +104,26 @@ const waitForRunningTestPlan = async (
 	}
 
 	if (latest.testPlanStatus === "ready") {
-		return { verdict: "ready", testPlanVersion: latest.testPlanVersion };
+		const source = await findTestPlanVersionSource(
+			application.applicationId,
+			branch,
+			latest.testPlanVersion,
+		);
+		if (
+			!options.generateTests &&
+			options.commitSha &&
+			source?.qcRunId &&
+			source.commitSha === options.commitSha
+		) {
+			const run = await getQcRun(source.qcRunId).catch(() => undefined);
+			return {
+				verdict: "ready",
+				testPlanVersion: latest.testPlanVersion,
+				runId: source.qcRunId,
+				stages: run?.stages,
+			};
+		}
+		return "plan-again";
 	}
 
 	const reason =
@@ -149,12 +176,36 @@ export const runQcStep = async (
 		};
 	}
 
-	const claimed = await claimTestPlanGeneration(
+	let claimed = await claimTestPlanGeneration(
 		application.applicationId,
 		QC_STALE_AFTER_MS,
 	);
 	if (!claimed) {
-		return waitForRunningTestPlan(application, shouldThrow);
+		const outcome = await waitForRunningTestPlan(
+			application,
+			source.branch,
+			options,
+			shouldThrow,
+		);
+		if (outcome !== "plan-again") {
+			return outcome;
+		}
+		claimed = await claimTestPlanGeneration(
+			application.applicationId,
+			QC_STALE_AFTER_MS,
+		);
+		if (!claimed) {
+			const reason =
+				"Another test plan run started before this one could; try again";
+			if (shouldThrow) {
+				throw new Error(reason);
+			}
+			return {
+				verdict: "error",
+				testPlanVersion: application.testPlanVersion,
+				reason,
+			};
+		}
 	}
 
 	try {
@@ -182,6 +233,9 @@ export const runQcStep = async (
 				testPlanStatus: "error",
 				testPlanError: reason,
 			});
+			if (shouldThrow) {
+				throw new Error(reason);
+			}
 			return {
 				verdict: "error",
 				testPlanVersion: application.testPlanVersion,

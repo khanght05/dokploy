@@ -6,6 +6,10 @@ const QC_SERVICE_API_KEY = process.env.QC_SERVICE_API_KEY;
 export const QC_SERVICE_TIMEOUT_MS =
 	Number(process.env.QC_SERVICE_TIMEOUT_SECONDS ?? 900) * 1000;
 const POLL_INTERVAL_MS = 3000;
+// One request, not the whole run: a service that accepts the connection but
+// never answers must not hold a deploy past QC_SERVICE_TIMEOUT_SECONDS.
+const QC_REQUEST_TIMEOUT_MS =
+	Number(process.env.QC_SERVICE_REQUEST_TIMEOUT_SECONDS ?? 60) * 1000;
 // Where the service can reach Dokploy's webhook receiver. Optional: without
 // it (or without QC_SERVICE_WEBHOOK_SECRET) runs are only polled.
 const QC_SERVICE_CALLBACK_URL = process.env.QC_SERVICE_CALLBACK_URL;
@@ -99,20 +103,31 @@ const qcFetch = async (path: string, init?: RequestInit) => {
 	if (!QC_SERVICE_BASE_URL) {
 		throw new Error("QC_SERVICE_BASE_URL is not configured");
 	}
-	const response = await fetch(`${QC_SERVICE_BASE_URL}${path}`, {
-		...init,
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${QC_SERVICE_API_KEY ?? ""}`,
-			...init?.headers,
-		},
-	});
-	if (!response.ok) {
-		throw new Error(
-			`QC service request failed (${response.status}): ${await response.text()}`,
-		);
+	const signal = init?.signal ?? AbortSignal.timeout(QC_REQUEST_TIMEOUT_MS);
+	try {
+		const response = await fetch(`${QC_SERVICE_BASE_URL}${path}`, {
+			...init,
+			signal,
+			headers: {
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${QC_SERVICE_API_KEY ?? ""}`,
+				...init?.headers,
+			},
+		});
+		if (!response.ok) {
+			throw new Error(
+				`QC service request failed (${response.status}): ${await response.text()}`,
+			);
+		}
+		return response;
+	} catch (error) {
+		if (signal.aborted && !init?.signal) {
+			throw new Error(
+				`QC service did not answer ${path} within ${QC_REQUEST_TIMEOUT_MS / 1000}s`,
+			);
+		}
+		throw error;
 	}
-	return response;
 };
 
 export const createQcRun = async (params: {

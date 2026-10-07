@@ -54,6 +54,11 @@ describe("getTestExecCommand", () => {
 		).toBe("");
 	});
 
+	test("runs the command through sh whatever ENTRYPOINT the image has", async () => {
+		const snippet = await getTestExecCommand(buildApp(), "dep1");
+		expect(snippet).toContain("docker run --rm --entrypoint sh app:latest -c ");
+	});
+
 	test("writes the marker and continues when tests fail with the open policy", async () => {
 		const snippet = await getTestExecCommand(
 			buildApp({ testExecFailurePolicy: "open" }),
